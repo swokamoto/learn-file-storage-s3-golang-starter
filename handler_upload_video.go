@@ -1,19 +1,78 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	command := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		filePath,
+	)
+
+	var output bytes.Buffer
+	command.Stdout = &output
+	if err := command.Run(); err != nil {
+		return "", fmt.Errorf("run ffprobe: %w", err)
+	}
+
+	probeResult := struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}{}
+	if err := json.Unmarshal(output.Bytes(), &probeResult); err != nil {
+		return "", fmt.Errorf("decode ffprobe output: %w", err)
+	}
+	if len(probeResult.Streams) == 0 || probeResult.Streams[0].Height == 0 {
+		return "", fmt.Errorf("ffprobe returned no valid video stream")
+	}
+
+	ratio := float64(probeResult.Streams[0].Width) / float64(probeResult.Streams[0].Height)
+	const tolerance = 0.02
+	if math.Abs(ratio-16.0/9.0) < tolerance {
+		return "16:9", nil
+	}
+	if math.Abs(ratio-9.0/16.0) < tolerance {
+		return "9:16", nil
+	}
+	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+	command := exec.Command(
+		"ffmpeg",
+		"-i", filePath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		"-f", "mp4",
+		outputFilePath,
+	)
+	if err := command.Run(); err != nil {
+		return "", fmt.Errorf("run ffmpeg: %w", err)
+	}
+	return outputFilePath, nil
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
@@ -81,22 +140,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Unable to read temporary video file", err)
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to determine video aspect ratio", err)
 		return
 	}
+	prefix := "other"
+	if aspectRatio == "16:9" {
+		prefix = "landscape"
+	} else if aspectRatio == "9:16" {
+		prefix = "portrait"
+	}
+
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to process video for fast start", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to open processed video file", err)
+		return
+	}
+	defer processedFile.Close()
 
 	keyBytes := make([]byte, 32)
 	if _, err := rand.Read(keyBytes); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to generate video key", err)
 		return
 	}
-	key := hex.EncodeToString(keyBytes) + ".mp4"
+	key := fmt.Sprintf("%s/%s.mp4", prefix, hex.EncodeToString(keyBytes))
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -104,7 +184,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+	videoURL := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, key)
 	video.VideoURL = &videoURL
 	if err := cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to update video metadata", err)
